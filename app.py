@@ -122,3 +122,4 @@ def render_bulk_health_check_ui():
             file_name='bulk_health_check_report.csv',
             mime='text/csv',
         )
+render_bulk_health_check_ui()
