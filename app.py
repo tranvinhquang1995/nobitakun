@@ -14,20 +14,26 @@ class BulkRegLogHealthChecker:
     
     def verify_single_endpoint(self, ws_url, action, username, password):
         """
-        Thực thi test trên một endpoint cụ thể.
-        Đã bổ sung cơ chế Auto-Sanitize URL để chặn Defect do Human Error.
+        Thực thi test trên một endpoint cụ thể, kèm theo cơ chế Fake Headers 
+        để bypass Cloudflare Anti-Bot.
         """
-        # [NEW UPDATE] Tự động chuẩn hóa Test Data (Protocol scheme)
         ws_url = ws_url.strip()
+        origin_url = ws_url.replace("wss://", "https://").replace("ws://", "http://")
+        
         if ws_url.startswith("https://"):
             ws_url = ws_url.replace("https://", "wss://", 1)
-            print(f"[Info] Auto-converted scheme to: {ws_url}")
         elif ws_url.startswith("http://"):
             ws_url = ws_url.replace("http://", "ws://", 1)
             
+        # Thêm Headers chuẩn để giả lập trình duyệt thật
+        custom_headers = [
+            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            f"Origin: {origin_url}"
+        ]
+            
         try:
-            # Set timeout (VD: 5s) để tránh treo script (Bottleneck)
-            ws = websocket.create_connection(ws_url, timeout=5)
+            # Truyền header vào config connection
+            ws = websocket.create_connection(ws_url, timeout=5, header=custom_headers)
             
             payload = {
                 "action": action,
@@ -39,8 +45,8 @@ class BulkRegLogHealthChecker:
             ws.close()
             
             return "Passed", response_raw
-        except websocket.WebSocketTimeoutException:
-            return "Failed (Timeout)", "Server không phản hồi sau 5s."
+        except websocket.WebSocketException as e:
+            return "Failed (WS Error)", f"Lỗi WebSocket: {str(e)}"
         except Exception as e:
             return "Failed (Error)", f"Lỗi kết nối: {str(e)}"
 
