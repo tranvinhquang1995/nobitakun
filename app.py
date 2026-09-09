@@ -1,87 +1,124 @@
 import streamlit as st
-import asyncio
-import aiohttp
-from bs4 import BeautifulSoup
+import json
+import websocket
 import pandas as pd
 import time
 
-# --- HÀM BẤT ĐỒNG BỘ ĐỂ LẤY DỮ LIỆU ---
-async def fetch_title(session, kts_number, base_url):
-    url = base_url.format(kts_number)
-    try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with session.get(url, timeout=timeout) as response:
-            if response.status == 200:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'lxml')
-                title = soup.title.string if soup.title else "Không tìm thấy Title"
-                return {"KTS": f"kts{kts_number}", "Title": title.strip(), "Status": "Thành công", "URL": url}
-            else:
-                return {"KTS": f"kts{kts_number}", "Title": "", "Status": f"Lỗi HTTP {response.status}", "URL": url}
-    except Exception as e:
-        return {"KTS": f"kts{kts_number}", "Title": "", "Status": f"Thất bại: {str(e)}", "URL": url}
-
-async def run_scraper(start, end, base_url):
-    # Giới hạn 50 request song song để không bị server block
-    connector = aiohttp.TCPConnector(limit=50)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
+class BulkRegLogHealthChecker:
+    """
+    Class xử lý kết nối WebSocket hỗ trợ ping check hàng loạt (Batch Execution).
+    Mục đích: Save effort tối đa cho QC. Thay vì test lặp đi lặp lại từng domain,
+    class này sẽ xử lý danh sách hàng chục/trăm endpoints chỉ với 1 cú click.
+    Tích hợp cơ chế Fail-fast (timeout) để không làm block toàn bộ tiến trình nếu 1 server down.
+    """
     
-    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-        tasks = [fetch_title(session, i, base_url) for i in range(start, end + 1)]
-        responses = await asyncio.gather(*tasks)
-        return responses
-
-# --- GIAO DIỆN STREAMLIT ---
-st.set_page_config(page_title="Tool Check Title URL", layout="wide")
-
-st.title("🔗 Tool Lấy Title Hàng Loạt Từ URL")
-st.write("Nhập thông số URL bên dưới. Ký tự `{}` trong link sẽ được thay thế bằng các số KTS.")
-
-# Cấu hình đầu vào
-default_url = "https://games.mt-sta.com/kts{}/?token=10-79494e8719042225c0a3bc9a89e42e29&ru=https://red88.navy/slots"
-base_url = st.text_input("Đường dẫn gốc (Sử dụng {} để làm biến số):", value=default_url)
-
-col1, col2 = st.columns(2)
-with col1:
-    start_num = st.number_input("Bắt đầu từ số:", min_value=1, value=9800, step=1)
-with col2:
-    end_num = st.number_input("Đến số:", min_value=1, value=9999, step=1)
-
-if st.button("🚀 Bắt Đầu Quét"):
-    if "{}" not in base_url:
-        st.error("Lỗi: Đường dẫn gốc phải chứa ký tự `{}` để thay thế biến số!")
-    elif start_num > end_num:
-        st.error("Lỗi: Số bắt đầu không thể lớn hơn số kết thúc!")
-    else:
-        st.info(f"Đang tiến hành quét {end_num - start_num + 1} links. Vui lòng đợi...")
-        start_time = time.time()
-        
-        # Xử lý event loop cho Streamlit (tránh lỗi asyncio RuntimeError)
+    def verify_single_endpoint(self, ws_url, action, username, password):
+        """
+        Thực thi test trên một endpoint cụ thể.
+        """
         try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            # Bắt buộc set timeout (VD: 5s) để tránh treo script khi server không phản hồi
+            ws = websocket.create_connection(ws_url, timeout=5)
             
-        # Chạy hàm lấy dữ liệu
-        results = loop.run_until_complete(run_scraper(start_num, end_num, base_url))
+            payload = {
+                "action": action,
+                "data": {"user": username, "pass": password}
+            }
+            
+            ws.send(json.dumps(payload))
+            response_raw = ws.recv()
+            ws.close()
+            
+            return "Passed", response_raw
+        except websocket.WebSocketTimeoutException:
+            return "Failed (Timeout)", "Server không phản hồi sau 5s."
+        except Exception as e:
+            return "Failed (Error)", f"Lỗi kết nối: {str(e)}"
+
+def render_bulk_health_check_ui():
+    """
+    UI dành cho luồng Batch Execution.
+    Hỗ trợ input nhiều URLs cùng lúc và xuất kết quả ra bảng Dataframe trực quan.
+    """
+    st.set_page_config(page_title="Bulk QC Health Check", page_icon="⚡", layout="wide")
+    
+    st.title("⚡ Canvas QA - Bulk Reg/Log Health Check")
+    st.markdown("Tool hỗ trợ verify **Happy path** hàng loạt cho nhiều Domain/Endpoint cùng lúc. Giúp team giảm thiểu manual **Effort** khi Release nhiều site.")
+
+    with st.form("bulk_health_check_form"):
+        st.subheader("1. Danh sách Test Environment (Endpoints)")
+        # Field mới: Text area cho phép nhập nhiều dòng
+        urls_input = st.text_area(
+            "Nhập danh sách WebSocket URLs (Mỗi URL một dòng):", 
+            value="wss://game1.client-server.com/ws\nwss://game2.client-server.com/ws",
+            height=150
+        )
         
-        # Tạo bảng kết quả bằng Pandas
-        df = pd.DataFrame(results)
-        elapsed_time = time.time() - start_time
+        st.subheader("2. Test Data & Scenario")
+        action = st.radio("Tính năng cần test (Test Scenario)", ["login", "register"], horizontal=True)
         
-        st.success(f"✅ Đã quét xong trong {elapsed_time:.2f} giây!")
+        col1, col2 = st.columns(2)
+        with col1:
+            username = st.text_input("Username", value="qc_tester_bulk")
+        with col2:
+            password = st.text_input("Password", value="123456", type="password")
+            
+        submit_btn = st.form_submit_button("🚀 Start Bulk Execution")
+
+    if submit_btn:
+        # Xử lý data đầu vào: tách dòng, xóa khoảng trắng, loại bỏ dòng trống
+        ws_urls = [url.strip() for url in urls_input.split('\n') if url.strip()]
+        total_urls = len(ws_urls)
         
-        # Hiển thị bảng
-        st.dataframe(df, use_container_width=True)
+        if total_urls == 0:
+            st.warning("⚠️ Vui lòng nhập ít nhất 1 URL để chạy test.")
+            return
+
+        st.info(f"Đang khởi chạy luồng Test Execution cho **{total_urls}** endpoints. Vui lòng chờ...")
         
-        # Nút tải file CSV
-        csv = df.to_csv(index=False).encode('utf-8')
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        checker = BulkRegLogHealthChecker()
+        results = []
+        
+        # Vòng lặp chạy qua từng URL
+        for idx, url in enumerate(ws_urls):
+            status_text.text(f"Executing ({idx + 1}/{total_urls}): Đang ping {url} ...")
+            
+            status, raw_resp = checker.verify_single_endpoint(url, action, username, password)
+            
+            results.append({
+                "ID": idx + 1,
+                "Endpoint URL": url,
+                "Action": action.upper(),
+                "Status": status,
+                "Actual Result (Raw)": raw_resp
+            })
+            
+            progress_bar.progress((idx + 1) / total_urls)
+            
+            # Delay nhẹ 0.5s giữa các URL để hệ thống mượt mà, không giật lag mạng nội bộ
+            time.sleep(0.5)
+            
+        st.success(f"✅ Bulk Execution Completed! Đã test xong {total_urls} endpoints.")
+        
+        # Hiển thị Test Summary dưới dạng Table
+        df_results = pd.DataFrame(results)
+        
+        # Highlight màu mè chút cho QC dễ nhìn Defect
+        def color_status(val):
+            color = 'green' if 'Passed' in val else 'red'
+            return f'color: {color}; font-weight: bold'
+            
+        styled_df = df_results.style.map(color_status, subset=['Status'])
+        st.dataframe(styled_df, use_container_width=True)
+        
+        # Export ra file để đính kèm Report
+        csv = df_results.to_csv(index=False).encode('utf-8')
         st.download_button(
-            label="⬇️ Tải kết quả (CSV)",
+            label="⬇️ Download Bug Report (.CSV)",
             data=csv,
-            file_name=f'ket_qua_title_{start_num}_den_{end_num}.csv',
+            file_name='bulk_health_check_report.csv',
             mime='text/csv',
         )
