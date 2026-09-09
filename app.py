@@ -15,9 +15,18 @@ class BulkRegLogHealthChecker:
     def verify_single_endpoint(self, ws_url, action, username, password):
         """
         Thực thi test trên một endpoint cụ thể.
+        Đã bổ sung cơ chế Auto-Sanitize URL để chặn Defect do Human Error.
         """
+        # [NEW UPDATE] Tự động chuẩn hóa Test Data (Protocol scheme)
+        ws_url = ws_url.strip()
+        if ws_url.startswith("https://"):
+            ws_url = ws_url.replace("https://", "wss://", 1)
+            print(f"[Info] Auto-converted scheme to: {ws_url}")
+        elif ws_url.startswith("http://"):
+            ws_url = ws_url.replace("http://", "ws://", 1)
+            
         try:
-            # Bắt buộc set timeout (VD: 5s) để tránh treo script khi server không phản hồi
+            # Set timeout (VD: 5s) để tránh treo script (Bottleneck)
             ws = websocket.create_connection(ws_url, timeout=5)
             
             payload = {
