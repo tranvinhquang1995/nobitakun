@@ -1,140 +1,216 @@
 import streamlit as st
-import json
-import websocket
+import asyncio
+import aiohttp
+from urllib.parse import urlparse
 import pandas as pd
 import time
+import tldextract
 
-class BulkRegLogHealthChecker:
-    """
-    Class xử lý kết nối WebSocket hỗ trợ ping check hàng loạt (Batch Execution).
-    Mục đích: Save effort tối đa cho QC. Thay vì test lặp đi lặp lại từng domain,
-    class này sẽ xử lý danh sách hàng chục/trăm endpoints chỉ với 1 cú click.
-    Tích hợp cơ chế Fail-fast (timeout) để không làm block toàn bộ tiến trình nếu 1 server down.
-    """
+# Hàm chuẩn hóa URL đầu vào
+def normalize_url(raw_url: str) -> str:
+    raw_url = raw_url.strip()
+    if not raw_url:
+        return ""
+    if not raw_url.startswith(("http://", "https://")):
+        return f"https://{raw_url}"
+    return raw_url
+
+# Hàm trích xuất domain chính (root domain hoặc registered domain)
+def extract_domain(url: str) -> str:
+    try:
+        extracted = tldextract.extract(url)
+        if extracted.registered_domain:
+            return extracted.registered_domain
+        return urlparse(url).netloc
+    except Exception:
+        return urlparse(url).netloc
+
+# Worker kiểm tra 1 URL
+async def check_url_access(session: aiohttp.ClientSession, original_url: str, timeout_sec: int = 10):
+    norm_url = normalize_url(original_url)
+    if not norm_url:
+        return None
+
+    orig_domain = extract_domain(norm_url)
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
     
-    def verify_single_endpoint(self, ws_url, action, username, password):
-        """
-        Thực thi test trên một endpoint cụ thể, kèm theo cơ chế Fake Headers 
-        để bypass Cloudflare Anti-Bot.
-        """
-        ws_url = ws_url.strip()
-        origin_url = ws_url.replace("wss://", "https://").replace("ws://", "http://")
-        
-        if ws_url.startswith("https://"):
-            ws_url = ws_url.replace("https://", "wss://", 1)
-        elif ws_url.startswith("http://"):
-            ws_url = ws_url.replace("http://", "ws://", 1)
+    try:
+        # allow_redirects=True để tự động theo vết các bước chuyển hướng
+        async with session.get(norm_url, timeout=timeout, allow_redirects=True, ssl=False) as response:
+            final_url = str(response.url)
+            final_domain = extract_domain(final_url)
+            status_code = response.status
             
-        # Thêm Headers chuẩn để giả lập trình duyệt thật
-        custom_headers = [
-            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            f"Origin: {origin_url}"
-        ]
+            # Kiểm tra xem có redirect hay không
+            history = response.history
+            is_redirected = len(history) > 0 or (norm_url.rstrip("/") != final_url.rstrip("/"))
             
-        try:
-            # Truyền header vào config connection
-            ws = websocket.create_connection(ws_url, timeout=5, header=custom_headers)
+            redirect_chain = [str(h.url) for h in history] + [final_url] if len(history) > 0 else []
             
-            payload = {
-                "action": action,
-                "data": {"user": username, "pass": password}
+            # Đánh giá khả năng truy cập
+            access_status = "Access OK" if status_code < 400 else f"HTTP Error {status_code}"
+
+            return {
+                "Input URL": original_url,
+                "Origin Domain": orig_domain,
+                "Access Status": access_status,
+                "Final HTTP Code": status_code,
+                "Is Redirected": "Yes" if is_redirected else "No",
+                "Final URL": final_url,
+                "Final Domain": final_domain,
+                "Redirect Steps": len(history),
+                "Redirect Chain": " ➔ ".join(redirect_chain) if redirect_chain else "None"
             }
             
-            ws.send(json.dumps(payload))
-            response_raw = ws.recv()
-            ws.close()
-            
-            return "Passed", response_raw
-        except websocket.WebSocketException as e:
-            return "Failed (WS Error)", f"Lỗi WebSocket: {str(e)}"
-        except Exception as e:
-            return "Failed (Error)", f"Lỗi kết nối: {str(e)}"
+    except asyncio.TimeoutError:
+        return {
+            "Input URL": original_url,
+            "Origin Domain": orig_domain,
+            "Access Status": "Timeout (Hết thời gian chờ)",
+            "Final HTTP Code": None,
+            "Is Redirected": "Unknown",
+            "Final URL": "",
+            "Final Domain": "",
+            "Redirect Steps": 0,
+            "Redirect Chain": "Error"
+        }
+    except aiohttp.ClientConnectorError as e:
+        return {
+            "Input URL": original_url,
+            "Origin Domain": orig_domain,
+            "Access Status": "Connection Failed (Domain chết / Lỗi DNS / Tắt server)",
+            "Final HTTP Code": None,
+            "Is Redirected": "No",
+            "Final URL": "",
+            "Final Domain": "",
+            "Redirect Steps": 0,
+            "Redirect Chain": "Error"
+        }
+    except Exception as e:
+        return {
+            "Input URL": original_url,
+            "Origin Domain": orig_domain,
+            "Access Status": f"Lỗi: {type(e).__name__}",
+            "Final HTTP Code": None,
+            "Is Redirected": "Unknown",
+            "Final URL": "",
+            "Final Domain": "",
+            "Redirect Steps": 0,
+            "Redirect Chain": "Error"
+        }
 
-def render_bulk_health_check_ui():
-    """
-    UI dành cho luồng Batch Execution.
-    Hỗ trợ input nhiều URLs cùng lúc và xuất kết quả ra bảng Dataframe trực quan.
-    """
-    st.set_page_config(page_title="Bulk QC Health Check", page_icon="⚡", layout="wide")
+# Quản lý hàng đợi request
+async def process_batch(urls, concurrency_limit, timeout_sec):
+    connector = aiohttp.TCPConnector(limit=concurrency_limit, verify_ssl=False)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
     
-    st.title("⚡ Canvas QA - Bulk Reg/Log Health Check")
-    st.markdown("Tool hỗ trợ verify **Happy path** hàng loạt cho nhiều Domain/Endpoint cùng lúc. Giúp team giảm thiểu manual **Effort** khi Release nhiều site.")
+    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+        tasks = [check_url_access(session, url, timeout_sec) for url in urls]
+        results = await asyncio.gather(*tasks)
+        return [r for r in results if r is not None]
 
-    with st.form("bulk_health_check_form"):
-        st.subheader("1. Danh sách Test Environment (Endpoints)")
-        # Field mới: Text area cho phép nhập nhiều dòng
-        urls_input = st.text_area(
-            "Nhập danh sách WebSocket URLs (Mỗi URL một dòng):", 
-            value="wss://game1.client-server.com/ws\nwss://game2.client-server.com/ws",
-            height=150
-        )
-        
-        st.subheader("2. Test Data & Scenario")
-        action = st.radio("Tính năng cần test (Test Scenario)", ["login", "register"], horizontal=True)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            username = st.text_input("Username", value="qc_tester_bulk")
-        with col2:
-            password = st.text_input("Password", value="123456", type="password")
-            
-        submit_btn = st.form_submit_button("🚀 Start Bulk Execution")
+# --- GIAO DIỆN STREAMLIT ---
+st.set_page_config(page_title="Bulk Domain Access & Redirect Checker", layout="wide")
 
-    if submit_btn:
-        # Xử lý data đầu vào: tách dòng, xóa khoảng trắng, loại bỏ dòng trống
-        ws_urls = [url.strip() for url in urls_input.split('\n') if url.strip()]
-        total_urls = len(ws_urls)
-        
-        if total_urls == 0:
-            st.warning("⚠️ Vui lòng nhập ít nhất 1 URL để chạy test.")
-            return
+st.title("🌐 Bulk Domain Access & Redirect Checker")
+st.write("Công cụ kiểm tra trạng thái sống/chết và theo dõi domain đích chuyển hướng (Redirect Chain) hàng loạt.")
 
-        st.info(f"Đang khởi chạy luồng Test Execution cho **{total_urls}** endpoints. Vui lòng chờ...")
+# Cột cấu hình
+with st.sidebar:
+    st.header("⚙️ Cấu hình quét")
+    concurrency = st.slider("Số request đồng thời (Concurrency):", min_value=5, max_value=100, value=30, step=5,
+                           help="Tăng tốc độ kiểm tra. Giá trị 30-50 là mức an toàn tránh bị nghẽn mạng máy chủ.")
+    timeout_val = st.slider("Thời gian timeout mỗi URL (giây):", min_value=3, max_value=30, value=10, step=1)
+    
+    st.markdown("---")
+    st.markdown("**Ghi chú kết quả:**")
+    st.markdown("- **Origin Domain**: Domain gốc ban đầu.")
+    st.markdown("- **Final Domain**: Domain đích sau khi chuyển hướng.")
+    st.markdown("- **Redirect Chain**: Chuỗi các URL đã nhảy qua.")
+
+# Nhận dữ liệu đầu vào
+tab1, tab2 = st.tabs(["📝 Nhập trực tiếp danh sách", "📁 Tải file danh sách (TXT / CSV)"])
+
+input_urls = []
+
+with tab1:
+    text_input = st.text_area(
+        "Nhập danh sách domain hoặc URL (mỗi dòng một link):",
+        placeholder="example.com\nhttp://facebook.com\nred88.navy/slots\nkts9944.com",
+        height=200
+    )
+    if text_input.strip():
+        input_urls = [line.strip() for line in text_input.splitlines() if line.strip()]
+
+with tab2:
+    uploaded_file = st.file_uploader("Tải file danh sách (.txt hoặc .csv):", type=["txt", "csv"])
+    if uploaded_file is not None:
+        if uploaded_file.name.endswith(".txt"):
+            content = uploaded_file.read().decode("utf-8")
+            input_urls = [line.strip() for line in content.splitlines() if line.strip()]
+        elif uploaded_file.name.endswith(".csv"):
+            df_upload = pd.read_csv(uploaded_file)
+            st.write("Xem trước file:", df_upload.head(3))
+            selected_col = st.selectbox("Chọn cột chứa URL/Domain:", df_upload.columns)
+            input_urls = df_upload[selected_col].dropna().astype(str).str.strip().tolist()
+
+# Xử lý khi nhấn nút Quét
+if st.button("🚀 Bắt đầu kiểm tra", type="primary"):
+    if not input_urls:
+        st.warning("Vui lòng nhập ít nhất 1 URL hoặc tải file lên!")
+    else:
+        # Loại bỏ các dòng trùng lặp nhưng vẫn giữ nguyên thứ tự
+        unique_urls = list(dict.fromkeys(input_urls))
+        st.info(f"Đang tiến hành kiểm tra {len(unique_urls)} link (đã loại bỏ trùng lặp)...")
         
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        start_time = time.time()
         
-        checker = BulkRegLogHealthChecker()
-        results = []
+        # Xử lý Event Loop
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        with st.spinner("Đang gửi request và phân tích redirect..."):
+            raw_results = loop.run_until_complete(process_batch(unique_urls, concurrency, timeout_val))
+            
+        elapsed_time = time.time() - start_time
+        df_result = pd.DataFrame(raw_results)
         
-        # Vòng lặp chạy qua từng URL
-        for idx, url in enumerate(ws_urls):
-            status_text.text(f"Executing ({idx + 1}/{total_urls}): Đang ping {url} ...")
-            
-            status, raw_resp = checker.verify_single_endpoint(url, action, username, password)
-            
-            results.append({
-                "ID": idx + 1,
-                "Endpoint URL": url,
-                "Action": action.upper(),
-                "Status": status,
-                "Actual Result (Raw)": raw_resp
-            })
-            
-            progress_bar.progress((idx + 1) / total_urls)
-            
-            # Delay nhẹ 0.5s giữa các URL để hệ thống mượt mà, không giật lag mạng nội bộ
-            time.sleep(0.5)
-            
-        st.success(f"✅ Bulk Execution Completed! Đã test xong {total_urls} endpoints.")
+        # Thống kê nhanh
+        st.success(f"✅ Hoàn thành quét {len(unique_urls)} URLs trong {elapsed_time:.2f} giây!")
         
-        # Hiển thị Test Summary dưới dạng Table
-        df_results = pd.DataFrame(results)
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        total_ok = (df_result["Access Status"] == "Access OK").sum()
+        total_redirect = (df_result["Is Redirected"] == "Yes").sum()
+        total_error = len(df_result) - total_ok
         
-        # Highlight màu mè chút cho QC dễ nhìn Defect
-        def color_status(val):
-            color = 'green' if 'Passed' in val else 'red'
-            return f'color: {color}; font-weight: bold'
-            
-        styled_df = df_results.style.map(color_status, subset=['Status'])
-        st.dataframe(styled_df, use_container_width=True)
+        col_m1.metric("Tổng số URL", len(df_result))
+        col_m2.metric("Truy cập thành công", total_ok)
+        col_m3.metric("Có chuyển hướng (Redirect)", total_redirect)
+        col_m4.metric("Lỗi / Không truy cập được", total_error)
         
-        # Export ra file để đính kèm Report
-        csv = df_results.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="⬇️ Download Bug Report (.CSV)",
-            data=csv,
-            file_name='bulk_health_check_report.csv',
-            mime='text/csv',
-        )
-render_bulk_health_check_ui()
+        # Bộ lọc nhanh kết quả
+        filter_option = st.radio("Lọc danh sách hiển thị:", ["Tất cả", "Chỉ URL có Redirect", "Chỉ URL Lỗi"], horizontal=True)
+        if filter_option == "Chỉ URL có Redirect":
+            display_df = df_result[df_result["Is Redirected"] == "Yes"]
+        elif filter_option == "Chỉ URL Lỗi":
+            display_df = df_result[df_result["Access Status"] != "Access OK"]
+        else:
+            display_df = df_result
+
+        st.dataframe(display_df, use_container_width=True)
+        
+        # Tải file kết quả
+        c1, c2 = st.columns(2)
+        with c1:
+            csv_data = df_result.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="⬇️ Tải kết quả về dạng CSV",
+                data=csv_data,
+                file_name="domain_access_results.csv",
+                mime="text/csv"
+            )
