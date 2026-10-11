@@ -3,3 +3,5 @@ aiohttp
 pandas
 tldextract
 openpyxl
+qrcode
+pillow
