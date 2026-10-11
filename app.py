@@ -3,7 +3,6 @@ import qrcode
 from PIL import Image, ImageDraw
 from io import BytesIO
 
-# Cấu hình trang (Tùy chọn cho đẹp)
 st.set_page_config(page_title="Tạo QR Code", page_icon="🔳")
 
 st.title("Công cụ tạo mã QR có Logo Tròn & Viền Trắng")
@@ -11,14 +10,14 @@ st.title("Công cụ tạo mã QR có Logo Tròn & Viền Trắng")
 # 1. Nhập liệu
 data = st.text_input("Nhập URL hoặc nội dung cần tạo QR:")
 logo_file = st.file_uploader("Tải lên Logo (PNG, JPG)", type=["png", "jpg", "jpeg"])
-border_thickness = st.slider("Độ dày viền trắng (pixel):", min_value=0, max_value=30, value=10)
+border_thickness = st.slider("Độ dày viền trắng (pixel):", min_value=0, max_value=60, value=20)
 
 if data:
-    # 2. Tạo mã QR cơ bản (Error Correction High để bù đắp phần logo che khuất)
+    # 2. Tạo mã QR cơ bản với box_size=30 để tăng chất lượng ảnh (độ phân giải cao)
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_H,
-        box_size=10,
+        box_size=30,  # <-- ĐÃ TĂNG TỪ 10 LÊN 30
         border=4,
     )
     qr.add_data(data)
@@ -40,8 +39,8 @@ if data:
         logo = logo.crop((left, top, right, bottom))
         
         # Tính toán kích thước
-        outer_size_px = qr_img.size[0] // 4  # Tổng kích thước (Logo + Viền) chiếm 1/4 QR
-        inner_size_px = outer_size_px - (border_thickness * 2) # Kích thước thực của Logo
+        outer_size_px = qr_img.size[0] // 4
+        inner_size_px = outer_size_px - (border_thickness * 2)
         
         if inner_size_px > 0:
             # Thu phóng logo
@@ -66,20 +65,20 @@ if data:
             # Tính toán vị trí trung tâm của QR
             pos = ((qr_img.size[0] - outer_size_px) // 2, (qr_img.size[1] - outer_size_px) // 2)
             
-            # Dán toàn bộ cụm (Logo + Nền trắng) lên QR (cắt tròn cụm này)
+            # Dán toàn bộ cụm (Logo + Nền trắng) lên QR
             qr_img.paste(white_bg, pos, outer_mask)
         else:
             st.warning("⚠️ Độ dày viền quá lớn che mất logo! Mã QR xuất ra sẽ không có logo.")
     
-    # 4. Xuất File (Các lệnh này nằm CÙNG LỀ với lệnh `if logo_file is not None:`)
+    # 4. Xuất File
     buf = BytesIO()
     qr_img.save(buf, format="PNG")
     
-    st.image(buf, caption="Mã QR của bạn")
+    st.image(buf, caption=f"Mã QR của bạn (Kích thước: {qr_img.size[0]}x{qr_img.size[1]}px)")
     st.download_button(
-        label="📥 Tải xuống QR", 
+        label="📥 Tải xuống QR chất lượng cao", 
         data=buf.getvalue(), 
-        file_name="qrcode_round_border.png", 
+        file_name="qrcode_high_res.png", 
         mime="image/png"
     )
 else:
