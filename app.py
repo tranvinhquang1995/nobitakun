@@ -1,9 +1,9 @@
 import streamlit as st
 import qrcode
-from PIL import Image
+from PIL import Image, ImageDraw
 from io import BytesIO
 
-st.title("Công cụ tạo mã QR có Logo nội bộ")
+st.title("Công cụ tạo mã QR có Logo Hình Tròn")
 
 # 1. Nhập nội dung
 data = st.text_input("Nhập URL hoặc nội dung cần tạo QR:")
@@ -12,7 +12,7 @@ data = st.text_input("Nhập URL hoặc nội dung cần tạo QR:")
 logo_file = st.file_uploader("Tải lên Logo (PNG, JPG)", type=["png", "jpg", "jpeg"])
 
 if data:
-    # Bắt buộc dùng ERROR_CORRECT_H (sửa lỗi 30%) để QR vẫn đọc được khi bị logo che
+    # Bắt buộc dùng ERROR_CORRECT_H (sửa lỗi 30%)
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_H,
@@ -22,22 +22,35 @@ if data:
     qr.add_data(data)
     qr.make(fit=True)
     
-    # Tạo ảnh QR và chuyển sang hệ RGB để dán logo màu
+    # Tạo ảnh QR và chuyển sang hệ RGB
     qr_img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
     
-    # Xử lý chèn logo nếu có
     if logo_file is not None:
-        logo = Image.open(logo_file)
+        # Mở logo và chuyển sang hệ RGBA để hỗ trợ kênh trong suốt (Alpha)
+        logo = Image.open(logo_file).convert("RGBA")
         
-        # Giới hạn kích thước logo bằng 1/4 kích thước QR code
-        logo_size = (qr_img.size[0] // 4, qr_img.size[1] // 4)
-        logo = logo.resize(logo_size, Image.Resampling.LANCZOS)
+        # Cắt logo thành hình vuông (lấy phần trung tâm) để khi bo tròn không bị méo
+        min_dim = min(logo.size)
+        left = (logo.size[0] - min_dim) / 2
+        top = (logo.size[1] - min_dim) / 2
+        right = (logo.size[0] + min_dim) / 2
+        bottom = (logo.size[1] + min_dim) / 2
+        logo = logo.crop((left, top, right, bottom))
         
-        # Tính toán tọa độ để đặt logo vào chính giữa
-        pos = ((qr_img.size[0] - logo_size[0]) // 2, (qr_img.size[1] - logo_size[1]) // 2)
+        # Đổi kích thước logo (bằng 1/4 kích thước QR code)
+        logo_size_px = qr_img.size[0] // 4
+        logo = logo.resize((logo_size_px, logo_size_px), Image.Resampling.LANCZOS)
         
-        # Dán logo vào QR code
-        qr_img.paste(logo, pos)
+        # Tạo mặt nạ (mask) hình tròn
+        mask = Image.new('L', (logo_size_px, logo_size_px), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.ellipse((0, 0, logo_size_px, logo_size_px), fill=255)
+        
+        # Tính toán tọa độ đặt logo
+        pos = ((qr_img.size[0] - logo_size_px) // 2, (qr_img.size[1] - logo_size_px) // 2)
+        
+        # Dán logo lên QR code, sử dụng mask hình tròn
+        qr_img.paste(logo, pos, mask)
     
     # Xuất file
     buf = BytesIO()
@@ -47,6 +60,6 @@ if data:
     st.download_button(
         label="Tải xuống QR", 
         data=buf.getvalue(), 
-        file_name="qrcode_logo.png", 
+        file_name="qrcode_round_logo.png", 
         mime="image/png"
     )
