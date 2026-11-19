@@ -5,3 +5,5 @@ tldextract
 openpyxl
 qrcode
 pillow
+beautifulsoup4
+lxml
